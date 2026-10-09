@@ -1,0 +1,99 @@
+# Coding-agent Sandbox. Fedora toolset matches the owner's distrobox:
+# zsh, oh-my-zsh, zoxide, zellij, neovim, uv, Go, Rust, Node, gh, task.
+ARG FEDORA_MAJOR_VERSION=43
+FROM registry.fedoraproject.org/fedora:${FEDORA_MAJOR_VERSION}
+
+ENV LANG=en_US.UTF-8 \
+    LC_ALL=en_US.UTF-8 \
+    HOME=/home/agent \
+    NPM_CONFIG_PREFIX=/usr/local \
+    npm_config_fund=false \
+    npm_config_audit=false \
+    npm_config_update_notifier=false
+
+# nodejs-npm is the Fedora package name (it provides npm). fd-find already
+# ships /usr/bin/fd. go-task's binary is go-task, not task. catatonit is
+# /usr/libexec/catatonit/catatonit.
+RUN dnf install -y \
+      zsh zoxide git gh curl wget openssh-clients neovim ripgrep fd-find \
+      htop jq golang rust cargo nodejs nodejs-npm python3 gcc gcc-c++ make \
+      go-task sudo less unzip tar xz which procps-ng catatonit \
+      glibc-langpack-en \
+    && dnf clean all \
+    && test -x /usr/bin/fd \
+    && test -x /usr/bin/go-task \
+    && ln -sfn /usr/bin/go-task /usr/local/bin/task \
+    && test -x /usr/libexec/catatonit/catatonit
+
+ARG UV_VERSION=0.12.24
+RUN curl -fsSL -o /tmp/uv.tar.gz \
+      "https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/uv-x86_64-unknown-linux-gnu.tar.gz" \
+    && echo "b4dfaef47d491a7296981f8374a4595f55dbf84e8937c8ecd2983574d8bb3da6  /tmp/uv.tar.gz" | sha256sum -c - \
+    && tar -xzf /tmp/uv.tar.gz -C /usr/local/bin --strip-components=1 \
+    && rm -f /tmp/uv.tar.gz \
+    && test -x /usr/local/bin/uv
+
+ARG ZELLIJ_VERSION=0.45.1
+# Upstream publishes a sha256 of the binary, not of the tarball.
+RUN curl -fsSL -o /tmp/zellij.tar.gz \
+      "https://github.com/zellij-org/zellij/releases/download/v${ZELLIJ_VERSION}/zellij-x86_64-unknown-linux-musl.tar.gz" \
+    && tar -xzf /tmp/zellij.tar.gz -C /usr/local/bin zellij \
+    && echo "d006c521dcb475a6005d741e9dd7c5758e5a23b28dd60a5c10cebfa4876319dd  /usr/local/bin/zellij" | sha256sum -c - \
+    && chmod 0755 /usr/local/bin/zellij \
+    && rm -f /tmp/zellij.tar.gz \
+    && zellij --version
+
+ARG HERDR_VERSION=0.9.3
+RUN curl -fsSL -o /usr/local/bin/herdr \
+      "https://github.com/herdrdev/herdr/releases/download/v${HERDR_VERSION}/herdr-linux-x86_64" \
+    && echo "18a8dc65f1c2fa485884344356dea1cfd911c6f06cf46fa78e193f4087f4dba7  /usr/local/bin/herdr" | sha256sum -c - \
+    && chmod 0755 /usr/local/bin/herdr \
+    && herdr --version
+
+ARG GROK_VERSION=1.0.41
+# The installer symlinks /usr/local/bin/grok through /root (mode 0700).
+# Copy the binary and drop the installer's /usr/local/bin/agent alias.
+# ENV HOME is /home/agent, and that path must stay empty. Point the
+# installer at /root so its download is the usual /root/.grok path.
+RUN curl -fsSL https://x.ai/cli/install.sh | HOME=/root bash -s "${GROK_VERSION}" \
+    && rm -f /usr/local/bin/grok /usr/local/bin/agent \
+    && install -m 0755 /root/.grok/downloads/grok-linux-x86_64 /usr/local/bin/grok \
+    && grok --version
+
+ARG CLAUDE_CODE_VERSION=2.1.295
+ARG CODEX_VERSION=0.162.0
+ARG CLAUDE_AGENT_ACP_VERSION=0.88.0
+ARG CODEX_ACP_VERSION=2.1.1
+RUN NPM_CONFIG_CACHE=/var/cache/npm npm install -g \
+      "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
+      "@openai/codex@${CODEX_VERSION}" \
+      "@agentclientprotocol/claude-agent-acp@${CLAUDE_AGENT_ACP_VERSION}" \
+      "@agentclientprotocol/codex-acp@${CODEX_ACP_VERSION}" \
+    && rm -rf /var/cache/npm
+
+# oh-my-zsh has no tags. git clone --branch rejects a raw commit, so fetch the SHA.
+ARG OHMYZSH_COMMIT=42a4ccb1b14dbeffe81259105a5243b4f4cb618e
+RUN git init -q /usr/share/oh-my-zsh \
+    && git -C /usr/share/oh-my-zsh remote add origin https://github.com/ohmyzsh/ohmyzsh.git \
+    && git -C /usr/share/oh-my-zsh fetch --depth 1 origin "${OHMYZSH_COMMIT}" \
+    && git -C /usr/share/oh-my-zsh checkout --detach FETCH_HEAD \
+    && rm -rf /usr/share/oh-my-zsh/.git \
+    && test -f /usr/share/oh-my-zsh/oh-my-zsh.sh
+
+# /home/agent is only the PVC mountpoint. Skel is copied on first boot.
+# Fedora's base image does not already use uid 1000.
+RUN groupadd --gid 1000 agent \
+    && useradd --uid 1000 --gid 1000 --home-dir /home/agent --shell /usr/bin/zsh --no-create-home agent \
+    && rm -rf /home/agent \
+    && mkdir -p /home/agent \
+    && chown 1000:1000 /home/agent \
+    && printf 'agent ALL=(ALL) NOPASSWD:ALL\n' > /etc/sudoers.d/agent \
+    && chmod 440 /etc/sudoers.d/agent
+
+COPY skel/ /etc/skel/
+COPY agent-entrypoint.sh /usr/local/bin/agent-entrypoint.sh
+RUN chmod 0755 /usr/local/bin/agent-entrypoint.sh
+
+USER agent
+WORKDIR /home/agent
+ENTRYPOINT ["/usr/libexec/catatonit/catatonit", "--", "/usr/local/bin/agent-entrypoint.sh"]

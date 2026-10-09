@@ -1,0 +1,460 @@
+#!/usr/bin/env bash
+# Manage coding-agent Sandboxes. Runs in the gateway image and on a workstation
+# whose kubeconfig already points at the cluster.
+set -euo pipefail
+
+AGENTS_NAMESPACE="${AGENTS_NAMESPACE:-agents}"
+AGENT_IMAGE="${AGENT_IMAGE:-ghcr.io/levitrammell/agent-coding:latest}"
+
+die() {
+  echo "error: $*" >&2
+  exit 1
+}
+
+usage() {
+  cat <<EOF
+Usage: agent <command> [args]
+
+Manage per-agent Sandboxes (namespace: ${AGENTS_NAMESPACE}, image: ${AGENT_IMAGE}).
+
+Commands:
+  new <name> [options]    Create Sandbox agent-<name>, wait until Ready, and attach
+  ls                      List Sandboxes (NAME MODE READY NODE AGE)
+  attach <name>           Resume if suspended, then exec herdr in the pod
+  shell <name>            Resume if suspended, then exec a login zsh
+  stop <name>             Suspend the Sandbox (pod is removed, home volume is kept)
+  start <name>            Set the Sandbox to Running and wait until Ready
+  rm <name> [--yes]       Delete the Sandbox and its home volume permanently
+  help                    Show this help
+
+Options for new:
+  --cpu <qty>             CPU request (default 500m)
+  --memory <qty>          Memory request (default 1Gi)
+  --cpu-limit <qty>       CPU limit (default 4)
+  --memory-limit <qty>    Memory limit (default 6Gi)
+  --disk <qty>            Home volume size (default 20Gi)
+  --repo <git-url>        git clone into /home/agent/work/<repo-name> after Ready
+  --dry-run               Print the Sandbox manifest and exit
+  --no-attach             Do not attach after create
+
+Environment:
+  AGENTS_NAMESPACE        Namespace for Sandboxes (default: agents)
+  AGENT_IMAGE             Image for new Sandboxes
+                          (default: ghcr.io/levitrammell/agent-coding:latest)
+EOF
+}
+
+validate_namespace() {
+  local ns="$1"
+  if [[ ! "$ns" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]]; then
+    die "AGENTS_NAMESPACE must be a DNS-1123 label (got: ${ns})"
+  fi
+}
+
+validate_image() {
+  local image="$1"
+  if [[ ! "$image" =~ ^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,255}$ ]]; then
+    die "AGENT_IMAGE is not a usable image reference: ${image}"
+  fi
+}
+
+# DNS-1123 label, at most 50 characters. Sandbox name is agent-<name> and the
+# home PVC is home-agent-<name>, which must stay within 63 characters.
+validate_name() {
+  local name="$1"
+  if [[ ! "$name" =~ ^[a-z0-9]([a-z0-9-]{0,48}[a-z0-9])?$ ]]; then
+    die "invalid name '${name}': use lowercase letters, digits, and hyphens; start and end with a letter or digit; at most 50 characters"
+  fi
+}
+
+validate_quantity() {
+  local label="$1"
+  local value="$2"
+  if [[ ! "$value" =~ ^[0-9]+(\.[0-9]+)?([eE][-+][0-9]+)?(m|Ki|Mi|Gi|Ti|Pi|Ei|k|K|M|G|T|P|E)?$ ]]; then
+    die "invalid ${label} quantity: ${value}"
+  fi
+}
+
+require_name() {
+  if [[ $# -ne 1 ]]; then
+    die "agent ${COMMAND} requires exactly one name"
+  fi
+  validate_name "$1"
+}
+
+sandbox_name() {
+  printf 'agent-%s' "$1"
+}
+
+# basename of the URL with a trailing .git removed. Reject anything that is
+# not a single safe path segment (SSH scp-style URLs have no slash).
+clone_dir_for() {
+  local repo="$1"
+  local base
+  base=$(basename "$repo" .git)
+  if [[ ! "$base" =~ ^[A-Za-z0-9._-]+$ ]]; then
+    die "cannot derive a safe clone directory from --repo (${repo}); use a URL whose last path segment is a repository name"
+  fi
+  printf '%s\n' "$base"
+}
+
+render_sandbox() {
+  local name="$1"
+  local cpu="$2"
+  local memory="$3"
+  local cpu_limit="$4"
+  local memory_limit="$5"
+  local disk="$6"
+  local sb
+  sb=$(sandbox_name "$name")
+  cat <<EOF
+apiVersion: agents.x-k8s.io/v1beta1
+kind: Sandbox
+metadata:
+  name: ${sb}
+  namespace: ${AGENTS_NAMESPACE}
+  labels:
+    app.kubernetes.io/part-of: agents
+    agents.ima.dev/name: ${name}
+spec:
+  operatingMode: Running
+  podTemplate:
+    metadata:
+      labels:
+        app.kubernetes.io/part-of: agents
+        agents.ima.dev/name: ${name}
+    spec:
+      restartPolicy: Always
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+      containers:
+        - name: agent
+          image: "${AGENT_IMAGE}"
+          imagePullPolicy: Always
+          securityContext:
+            runAsUser: 1000
+            runAsGroup: 1000
+          envFrom:
+            - secretRef:
+                name: agent-credentials
+                optional: true
+          resources:
+            requests:
+              cpu: "${cpu}"
+              memory: "${memory}"
+            limits:
+              cpu: "${cpu_limit}"
+              memory: "${memory_limit}"
+          volumeMounts:
+            - name: home
+              mountPath: /home/agent
+  volumeClaimTemplates:
+    - metadata:
+        name: home
+      spec:
+        storageClassName: longhorn
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: "${disk}"
+EOF
+}
+
+sandbox_exists() {
+  local sb="$1"
+  kubectl -n "$AGENTS_NAMESPACE" get sandbox "$sb" >/dev/null 2>&1
+}
+
+ensure_running() {
+  local name="$1"
+  local sb mode
+  sb=$(sandbox_name "$name")
+  mode=$(kubectl -n "$AGENTS_NAMESPACE" get sandbox "$sb" -o jsonpath='{.spec.operatingMode}') \
+    || die "failed to read Sandbox ${sb}"
+  if [[ "$mode" == "Suspended" ]]; then
+    kubectl -n "$AGENTS_NAMESPACE" patch sandbox "$sb" --type=merge \
+      -p '{"spec":{"operatingMode":"Running"}}'
+    kubectl -n "$AGENTS_NAMESPACE" wait "sandbox/${sb}" --for=condition=Ready --timeout=300s
+  fi
+}
+
+# -it only when stdin is a tty. herdr is the bare binary: it launches or
+# attaches the default background session. There is no attach subcommand.
+# kubectl exec does not forward TERM, so pass the client's through for TUIs.
+exec_tty() {
+  local sb="$1"
+  shift
+  if [[ -t 0 ]]; then
+    kubectl -n "$AGENTS_NAMESPACE" exec -it "$sb" -c agent -- env TERM="${TERM:-xterm-256color}" "$@"
+  else
+    kubectl -n "$AGENTS_NAMESPACE" exec "$sb" -c agent -- "$@"
+  fi
+}
+
+human_age() {
+  local ts="$1"
+  local epoch now delta
+  if [[ -z "$ts" ]]; then
+    printf '%s' "-"
+    return 0
+  fi
+  if [[ "$ts" == *.* ]]; then
+    ts="${ts%%.*}Z"
+  fi
+  if ! epoch=$(date -u -d "$ts" +%s 2>/dev/null); then
+    if ! epoch=$(date -u -j -f "%Y-%m-%dT%H:%M:%SZ" "$ts" +%s 2>/dev/null); then
+      printf '%s' "$ts"
+      return 0
+    fi
+  fi
+  now=$(date -u +%s)
+  delta=$((now - epoch))
+  if ((delta < 0)); then
+    delta=0
+  fi
+  if ((delta < 120)); then
+    printf '%ds' "$delta"
+  elif ((delta < 7200)); then
+    printf '%dm' $((delta / 60))
+  elif ((delta < 172800)); then
+    printf '%dh' $((delta / 3600))
+  else
+    printf '%dd' $((delta / 86400))
+  fi
+}
+
+cmd_new() {
+  local name="" cpu="500m" memory="1Gi" cpu_limit="4" memory_limit="6Gi" disk="20Gi"
+  local repo="" dry_run=0 no_attach=0
+  local sb manifest dest
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --cpu)
+        [[ $# -ge 2 ]] || die "--cpu requires a value"
+        cpu="$2"
+        shift 2
+        ;;
+      --memory)
+        [[ $# -ge 2 ]] || die "--memory requires a value"
+        memory="$2"
+        shift 2
+        ;;
+      --cpu-limit)
+        [[ $# -ge 2 ]] || die "--cpu-limit requires a value"
+        cpu_limit="$2"
+        shift 2
+        ;;
+      --memory-limit)
+        [[ $# -ge 2 ]] || die "--memory-limit requires a value"
+        memory_limit="$2"
+        shift 2
+        ;;
+      --disk)
+        [[ $# -ge 2 ]] || die "--disk requires a value"
+        disk="$2"
+        shift 2
+        ;;
+      --repo)
+        [[ $# -ge 2 ]] || die "--repo requires a value"
+        repo="$2"
+        shift 2
+        ;;
+      --dry-run)
+        dry_run=1
+        shift
+        ;;
+      --no-attach)
+        no_attach=1
+        shift
+        ;;
+      --)
+        shift
+        break
+        ;;
+      -*)
+        die "unknown option: $1"
+        ;;
+      *)
+        if [[ -n "$name" ]]; then
+          die "unexpected argument: $1"
+        fi
+        name="$1"
+        shift
+        ;;
+    esac
+  done
+  if [[ $# -gt 0 ]]; then
+    if [[ -n "$name" ]]; then
+      die "unexpected argument: $1"
+    fi
+    name="$1"
+    shift
+    if [[ $# -gt 0 ]]; then
+      die "unexpected argument: $1"
+    fi
+  fi
+
+  [[ -n "$name" ]] || die "agent new requires a name"
+  validate_name "$name"
+  validate_quantity cpu "$cpu"
+  validate_quantity memory "$memory"
+  validate_quantity cpu-limit "$cpu_limit"
+  validate_quantity memory-limit "$memory_limit"
+  validate_quantity disk "$disk"
+  if [[ -n "$repo" && "$repo" == *$'\n'* ]]; then
+    die "--repo must be a single-line URL"
+  fi
+
+  sb=$(sandbox_name "$name")
+  if [[ "$dry_run" -eq 0 ]]; then
+    if sandbox_exists "$sb"; then
+      die "Sandbox ${sb} already exists; use 'agent attach ${name}' instead"
+    fi
+  fi
+
+  manifest=$(render_sandbox "$name" "$cpu" "$memory" "$cpu_limit" "$memory_limit" "$disk")
+  if [[ "$dry_run" -eq 1 ]]; then
+    printf '%s\n' "$manifest"
+    return 0
+  fi
+
+  printf '%s\n' "$manifest" | kubectl apply -f -
+  kubectl -n "$AGENTS_NAMESPACE" wait "sandbox/${sb}" --for=condition=Ready --timeout=300s
+
+  if [[ -n "$repo" ]]; then
+    dest=$(clone_dir_for "$repo")
+    kubectl -n "$AGENTS_NAMESPACE" exec "$sb" -c agent -- \
+      git clone "$repo" "/home/agent/work/${dest}"
+  fi
+
+  if [[ "$no_attach" -eq 0 ]]; then
+    exec_tty "$sb" herdr
+  fi
+}
+
+cmd_ls() {
+  local rows sb mode ready created node age short
+  if [[ $# -ne 0 ]]; then
+    die "agent ls takes no arguments"
+  fi
+  printf '%-32s %-12s %-8s %-20s %s\n' NAME MODE READY NODE AGE
+  rows=$(kubectl -n "$AGENTS_NAMESPACE" get sandbox -l app.kubernetes.io/part-of=agents \
+    -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.operatingMode}{"\t"}{range .status.conditions[?(@.type=="Ready")]}{.status}{end}{"\t"}{.metadata.creationTimestamp}{"\n"}{end}') \
+    || die "failed to list Sandboxes"
+  if [[ -z "$rows" ]]; then
+    return 0
+  fi
+  while IFS=$'\t' read -r sb mode ready created; do
+    [[ -z "${sb}" ]] && continue
+    node=$(kubectl -n "$AGENTS_NAMESPACE" get pod "$sb" -o jsonpath='{.spec.nodeName}' 2>/dev/null || true)
+    [[ -z "$node" ]] && node="<none>"
+    [[ -z "$ready" ]] && ready="Unknown"
+    [[ -z "$mode" ]] && mode="Unknown"
+    age=$(human_age "$created")
+    short="${sb#agent-}"
+    printf '%-32s %-12s %-8s %-20s %s\n' "$short" "$mode" "$ready" "$node" "$age"
+  done <<< "$rows"
+}
+
+cmd_attach() {
+  local sb
+  require_name "$@"
+  ensure_running "$1"
+  sb=$(sandbox_name "$1")
+  exec_tty "$sb" herdr
+}
+
+cmd_shell() {
+  local sb
+  require_name "$@"
+  ensure_running "$1"
+  sb=$(sandbox_name "$1")
+  exec_tty "$sb" zsh -l
+}
+
+cmd_stop() {
+  local sb
+  require_name "$@"
+  sb=$(sandbox_name "$1")
+  kubectl -n "$AGENTS_NAMESPACE" patch sandbox "$sb" --type=merge \
+    -p '{"spec":{"operatingMode":"Suspended"}}'
+}
+
+cmd_start() {
+  local sb
+  require_name "$@"
+  sb=$(sandbox_name "$1")
+  kubectl -n "$AGENTS_NAMESPACE" patch sandbox "$sb" --type=merge \
+    -p '{"spec":{"operatingMode":"Running"}}'
+  kubectl -n "$AGENTS_NAMESPACE" wait "sandbox/${sb}" --for=condition=Ready --timeout=300s
+}
+
+cmd_rm() {
+  local name="" yes=0 arg confirm sb
+  for arg in "$@"; do
+    case "$arg" in
+      --yes)
+        yes=1
+        ;;
+      --)
+        ;;
+      -*)
+        die "unknown option: ${arg}"
+        ;;
+      *)
+        if [[ -n "$name" ]]; then
+          die "unexpected argument: ${arg}"
+        fi
+        name="$arg"
+        ;;
+    esac
+  done
+  [[ -n "$name" ]] || die "agent rm requires a name"
+  validate_name "$name"
+  sb=$(sandbox_name "$name")
+  echo "WARNING: this deletes Sandbox ${sb} and its home PersistentVolumeClaim permanently." >&2
+  if [[ "$yes" -ne 1 ]]; then
+    printf 'Type %s to confirm: ' "$name" >&2
+    if ! read -r confirm; then
+      die "aborted"
+    fi
+    if [[ -z "$confirm" || "$confirm" != "$name" ]]; then
+      die "aborted"
+    fi
+  fi
+  kubectl -n "$AGENTS_NAMESPACE" delete sandbox "$sb"
+}
+
+main() {
+  local cmd
+  validate_namespace "$AGENTS_NAMESPACE"
+  validate_image "$AGENT_IMAGE"
+  if [[ $# -eq 0 ]]; then
+    usage
+    return 0
+  fi
+  cmd="$1"
+  shift
+  case "$cmd" in
+    new) cmd_new "$@" ;;
+    ls) cmd_ls "$@" ;;
+    attach) cmd_attach "$@" ;;
+    shell) cmd_shell "$@" ;;
+    stop) cmd_stop "$@" ;;
+    start) cmd_start "$@" ;;
+    rm) cmd_rm "$@" ;;
+    help | -h | --help) usage ;;
+    *)
+      echo "error: unknown command: ${cmd}" >&2
+      usage >&2
+      exit 1
+      ;;
+  esac
+}
+
+COMMAND="${1:-}"
+main "$@"

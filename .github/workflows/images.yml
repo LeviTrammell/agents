@@ -1,0 +1,98 @@
+---
+name: Images
+on:
+  schedule:
+    - cron: '05 10 * * 0' # 10:05am UTC every Sunday
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - '**/README.md'
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Test gateway-app
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: gateway-app/go.mod
+          cache-dependency-path: gateway-app/go.sum
+      - name: Vet and test
+        working-directory: gateway-app
+        run: go vet ./... && go test ./...
+
+  build:
+    name: Build and push ${{ matrix.image }}
+    needs: test
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      packages: write
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: agent-coding
+            containerfile: ./images/agent-coding/Containerfile
+            context: ./images/agent-coding
+          - image: agent-ssh
+            containerfile: ./gateway-app/Containerfile
+            context: ./gateway-app
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Maximize build space
+        continue-on-error: true
+        uses: ublue-os/remove-unwanted-software@v8
+
+      - name: Install Podman and Buildah
+        run: sudo apt update && sudo apt install -y buildah podman
+
+      - name: Image Metadata
+        uses: docker/metadata-action@v5
+        id: meta
+        with:
+          images: |
+            ghcr.io/levitrammell/${{ matrix.image }}
+          labels: |
+            org.opencontainers.image.title=${{ matrix.image }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=schedule,pattern={{date 'YYYYMMDD'}}
+            type=sha
+
+      - name: Login to GitHub Container Registry
+        if: github.event_name != 'pull_request'
+        uses: redhat-actions/podman-login@v1
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build Image
+        id: build
+        uses: redhat-actions/buildah-build@v2
+        with:
+          oci: false
+          context: ${{ matrix.context }}
+          containerfiles: |
+            ${{ matrix.containerfile }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          platforms: linux/amd64
+
+      - name: Push Image to GHCR
+        if: github.event_name != 'pull_request'
+        uses: redhat-actions/push-to-registry@v2
+        with:
+          tags: ${{ steps.meta.outputs.tags }}

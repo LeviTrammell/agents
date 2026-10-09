@@ -1,0 +1,22 @@
+# Build context is services/agents/gateway-app (this directory).
+FROM docker.io/library/golang:1.26-bookworm AS builder
+
+WORKDIR /src
+
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+
+# Static binary: distroless/static has no libc.
+RUN CGO_ENABLED=0 GOTOOLCHAIN=auto go build -trimpath -ldflags="-s -w" -o /out/agent-ssh .
+
+FROM gcr.io/distroless/static-debian12:nonroot
+
+COPY --from=builder /out/agent-ssh /usr/local/bin/agent-ssh
+
+EXPOSE 2222
+
+USER nonroot:nonroot
+
+ENTRYPOINT ["/usr/local/bin/agent-ssh"]
