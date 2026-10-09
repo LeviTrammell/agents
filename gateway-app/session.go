@@ -55,19 +55,11 @@ func handleSession(sess sshlib.Session, clients *k8sctl.Clients, cfg Config) {
 	logger := slog.With("user", user, "remote", sess.RemoteAddr().String())
 
 	pty, windowChanges, hasPty := sess.Pty()
-	cmd := sess.Command()
 
 	if !hasPty {
-		if len(cmd) == 0 {
-			// `ssh -N ...`: no shell/exec requested at all. The only point
-			// of this session is the direct-tcpip channels already
-			// negotiated alongside it (LocalPortForwardingCallback),
-			// which run independently of this handler. Just block until
-			// the client disconnects.
-			logger.Info("session without pty or command: holding open for port forwards")
-			<-ctx.Done()
-			return
-		}
+		// `ssh -N` never opens a session channel (its forwards are their own
+		// direct-tcpip channels), so anything landing here wanted a shell or
+		// command without a terminal. Refuse instead of hanging.
 		wish.Fatalln(sess, "agent-ssh requires a PTY; reconnect with ssh -t")
 		logger.Info("rejected session: no pty")
 		return
