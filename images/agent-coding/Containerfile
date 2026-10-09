@@ -6,6 +6,7 @@ FROM registry.fedoraproject.org/fedora:${FEDORA_MAJOR_VERSION}
 ENV LANG=en_US.UTF-8 \
     LC_ALL=en_US.UTF-8 \
     HOME=/home/agent \
+    SHELL=/usr/bin/zsh \
     NPM_CONFIG_PREFIX=/usr/local \
     npm_config_fund=false \
     npm_config_audit=false \
