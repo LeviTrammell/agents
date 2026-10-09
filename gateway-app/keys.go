@@ -1,7 +1,9 @@
 package main
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 
@@ -16,16 +18,26 @@ import (
 // ssh_host_rsa_key -- the same two keys the old shell-based gateway used,
 // so clients that already trust them don't see a host-key warning.
 func loadHostSigners(dir string) ([]sshlib.Signer, error) {
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	if err := os.MkdirAll(dir, 0o700); err != nil { // no-op when the directory is a mounted volume
 		return nil, fmt.Errorf("creating host key directory %s: %w", dir, err)
 	}
 
 	var signers []sshlib.Signer
 
 	ed25519Path := filepath.Join(dir, "ssh_host_ed25519_key")
-	kp, err := keygen.New(ed25519Path, keygen.WithKeyType(keygen.Ed25519), keygen.WithWrite())
+	kp, err := keygen.New(ed25519Path, keygen.WithKeyType(keygen.Ed25519))
 	if err != nil {
 		return nil, fmt.Errorf("loading/generating ed25519 host key %s: %w", ed25519Path, err)
+	}
+	// keygen.WithWrite chmods the parent directory to 0700, which a non-root
+	// process can't do on a mounted volume, so write a new key pair ourselves.
+	if _, err := os.Stat(ed25519Path); errors.Is(err, fs.ErrNotExist) {
+		if err := os.WriteFile(ed25519Path, kp.RawPrivateKey(), 0o600); err != nil {
+			return nil, fmt.Errorf("writing ed25519 host key %s: %w", ed25519Path, err)
+		}
+		if err := os.WriteFile(ed25519Path+".pub", kp.RawAuthorizedKey(), 0o644); err != nil {
+			return nil, fmt.Errorf("writing ed25519 host public key %s.pub: %w", ed25519Path, err)
+		}
 	}
 	signers = append(signers, kp.Signer())
 
