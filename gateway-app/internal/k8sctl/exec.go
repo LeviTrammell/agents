@@ -5,7 +5,6 @@ import (
 	"io"
 
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/util/httpstream"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/tools/remotecommand"
 )
@@ -21,10 +20,9 @@ type ExecStreams struct {
 }
 
 // Exec runs command in the named pod's "agent" container and bridges it to
-// streams until it exits or ctx is cancelled. It prefers the WebSocket
-// executor and falls back to SPDY on upgrade failure, per the task's
-// instructions (newer kubelets speak both; this keeps the gateway working
-// against older ones too).
+// streams until it exits or ctx is cancelled. It uses SPDY only: client-go's
+// WebSocket executor kept its heartbeat goroutine pinging a dead connection
+// forever after an SSH client dropped mid-attach.
 func (c *Clients) Exec(ctx context.Context, namespace, podName string, command []string, streams ExecStreams) error {
 	req := c.Clientset.CoreV1().RESTClient().Post().
 		Resource("pods").
@@ -47,16 +45,7 @@ func (c *Clients) Exec(ctx context.Context, namespace, podName string, command [
 		return err
 	}
 
-	executor := spdyExec
-	if wsExec, err := remotecommand.NewWebSocketExecutor(c.Config, "GET", url.String()); err == nil {
-		if fb, err := remotecommand.NewFallbackExecutor(wsExec, spdyExec, func(err error) bool {
-			return httpstream.IsUpgradeFailure(err) || httpstream.IsHTTPSProxyError(err)
-		}); err == nil {
-			executor = fb
-		}
-	}
-
-	return executor.StreamWithContext(ctx, remotecommand.StreamOptions{
+	return spdyExec.StreamWithContext(ctx, remotecommand.StreamOptions{
 		Stdin:             streams.Stdin,
 		Stdout:            streams.Stdout,
 		Stderr:            streams.Stderr,
