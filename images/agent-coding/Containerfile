@@ -51,6 +51,18 @@ RUN curl -fsSL -o /usr/local/bin/herdr \
     && chmod 0755 /usr/local/bin/herdr \
     && herdr --version
 
+ARG MOSHI_HOOK_VERSION=0.4.24
+# Moshi's agent hooks: push notifications and Approve/Deny on the phone.
+# Paired and started per agent by agent-entrypoint.sh when MOSHI_PAIRING_TOKEN is set.
+RUN curl -fsSL -o /tmp/moshi-hook.tar.gz \
+      "https://cdn.getmoshi.app/hook/v${MOSHI_HOOK_VERSION}/moshi-hook_Linux_x86_64.tar.gz" \
+    && echo "b4c268c5970cc8a1d72cf22eac05e49494df0686e16c4c218127debbcc4a8e71  /tmp/moshi-hook.tar.gz" | sha256sum -c - \
+    && tar -xzf /tmp/moshi-hook.tar.gz -C /usr/local/bin moshi-hook \
+    && chmod 0755 /usr/local/bin/moshi-hook \
+    && ln -sfn moshi-hook /usr/local/bin/moshi \
+    && rm -f /tmp/moshi-hook.tar.gz \
+    && moshi-hook --version
+
 ARG GROK_VERSION=1.0.41
 # The installer symlinks /usr/local/bin/grok through /root (mode 0700).
 # Copy the binary and drop the installer's /usr/local/bin/agent alias.
