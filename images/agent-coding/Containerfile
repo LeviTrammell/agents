@@ -81,6 +81,12 @@ RUN git init -q /usr/share/oh-my-zsh \
     && rm -rf /usr/share/oh-my-zsh/.git \
     && test -f /usr/share/oh-my-zsh/oh-my-zsh.sh
 
+# git uses gh (and so GH_TOKEN from the agent-credentials Secret) for
+# github.com. System-wide, so it also applies to agents created earlier.
+RUN git config --system credential.https://github.com.helper '' \
+    && git config --system --add credential.https://github.com.helper '!/usr/bin/gh auth git-credential' \
+    && git config --system init.defaultBranch main
+
 # /home/agent is only the PVC mountpoint. Skel is copied on first boot.
 # Fedora's base image does not already use uid 1000.
 RUN groupadd --gid 1000 agent \
