@@ -2,7 +2,11 @@ package main
 
 import (
 	"context"
+	"errors"
+	"io"
+	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -70,20 +74,39 @@ func withResumeTracker(ctx context.Context, t *resumeTracker) context.Context {
 }
 
 // trackAttach wraps an attach so the session's tracker (if any) records how
-// it ended: if the client connection is gone when the attach returns, the
-// drop is remembered for a quick reconnect; if the client is still there,
-// the user detached on purpose and the next login gets the menu.
-func trackAttach(ctx context.Context, agent string, attach func() error) error {
+// it ended. The client counts as gone if the session context is done or if
+// its stdin hit EOF (a clean disconnect can end the exec stream before the
+// context is cancelled). Gone means remember the agent for a quick
+// reconnect; still connected means the user detached on purpose, so the
+// next login gets the menu. attach receives the stdin it must use.
+func trackAttach(ctx context.Context, agent string, stdin io.Reader, attach func(io.Reader) error) error {
 	t, _ := ctx.Value(resumeTrackerKey{}).(*resumeTracker)
 	if t == nil {
-		return attach()
+		return attach(stdin)
 	}
+	in := &eofReader{r: stdin}
 	t.store.remember(t.key, agent) // covers a drop that kills us mid-attach
-	err := attach()
-	if ctx.Err() != nil {
+	err := attach(in)
+	dropped := ctx.Err() != nil || in.sawEOF.Load()
+	slog.Info("attach ended", "agent", agent, "dropped", dropped, "ctxDone", ctx.Err() != nil, "stdinEOF", in.sawEOF.Load())
+	if dropped {
 		t.store.remember(t.key, agent) // restart the window from the drop
 	} else {
 		t.store.forget(t.key)
 	}
 	return err
+}
+
+// eofReader notes whether the underlying reader ever returned EOF.
+type eofReader struct {
+	r      io.Reader
+	sawEOF atomic.Bool
+}
+
+func (e *eofReader) Read(p []byte) (int, error) {
+	n, err := e.r.Read(p)
+	if errors.Is(err, io.EOF) {
+		e.sawEOF.Store(true)
+	}
+	return n, err
 }

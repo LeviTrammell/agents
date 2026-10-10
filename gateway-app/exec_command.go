@@ -33,7 +33,7 @@ func (c *attachExecCommand) Run() error {
 	if err != nil {
 		return err
 	}
-	return trackAttach(c.ctx, c.agentName, func() error {
-		return attachCommand(c.ctx, c.clients, c.namespace, pod, c.command, c.stdin, c.stdout, c.stderr, c.broadcaster.TerminalSizeQueue())
+	return trackAttach(c.ctx, c.agentName, c.stdin, func(in io.Reader) error {
+		return attachCommand(c.ctx, c.clients, c.namespace, pod, c.command, in, c.stdout, c.stderr, c.broadcaster.TerminalSizeQueue())
 	})
 }

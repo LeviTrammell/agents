@@ -3,13 +3,14 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 
 	tea "charm.land/bubbletea/v2"
 	sshlib "charm.land/ssh"
-	gossh "golang.org/x/crypto/ssh"
 	"charm.land/wish/v2"
 	"charm.land/wish/v2/bubbletea"
+	gossh "golang.org/x/crypto/ssh"
 
 	"github.com/levitrammell/agents/gateway-app/internal/agents"
 	"github.com/levitrammell/agents/gateway-app/internal/k8sctl"
@@ -158,8 +159,8 @@ func runNewAgentFlow(ctx context.Context, sess sshlib.Session, clients *k8sctl.C
 	}
 
 	pod := agents.SandboxName(nm.result.Name)
-	err = trackAttach(ctx, nm.result.Name, func() error {
-		return attachCommand(ctx, clients, cfg.Namespace, pod, herdrCommand(term, cfg.DebugEcho), sess, sess, nil, broadcaster.TerminalSizeQueue())
+	err = trackAttach(ctx, nm.result.Name, sess, func(in io.Reader) error {
+		return attachCommand(ctx, clients, cfg.Namespace, pod, herdrCommand(term, cfg.DebugEcho), in, sess, nil, broadcaster.TerminalSizeQueue())
 	})
 	if err != nil {
 		wish.Errorf(sess, "attach to agent-%s: %v\r\n", nm.result.Name, err)
@@ -218,8 +219,8 @@ func resumeDroppedAttach(ctx context.Context, sess sshlib.Session, clients *k8sc
 		wish.Errorf(sess, "%v\r\n", err)
 		return ctx.Err() == nil
 	}
-	err = trackAttach(ctx, name, func() error {
-		return attachCommand(ctx, clients, cfg.Namespace, pod, herdrCommand(term, cfg.DebugEcho), sess, sess, nil, broadcaster.TerminalSizeQueue())
+	err = trackAttach(ctx, name, sess, func(in io.Reader) error {
+		return attachCommand(ctx, clients, cfg.Namespace, pod, herdrCommand(term, cfg.DebugEcho), in, sess, nil, broadcaster.TerminalSizeQueue())
 	})
 	if err != nil && ctx.Err() == nil {
 		wish.Errorf(sess, "attach to agent-%s: %v\r\n", name, err)
