@@ -88,7 +88,7 @@ func trackAttach(ctx context.Context, agent string, stdin io.Reader, attach func
 	t.store.remember(t.key, agent) // covers a drop that kills us mid-attach
 	err := attach(in)
 	dropped := ctx.Err() != nil || in.sawEOF.Load()
-	slog.Info("attach ended", "agent", agent, "dropped", dropped, "ctxDone", ctx.Err() != nil, "stdinEOF", in.sawEOF.Load())
+	slog.Info("attach ended", "agent", agent, "dropped", dropped, "ctxDone", ctx.Err() != nil, "stdinEOF", in.sawEOF.Load(), "error", err)
 	if dropped {
 		t.store.remember(t.key, agent) // restart the window from the drop
 	} else {
