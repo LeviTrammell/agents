@@ -7,6 +7,7 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 	sshlib "charm.land/ssh"
+	gossh "golang.org/x/crypto/ssh"
 	"charm.land/wish/v2"
 	"charm.land/wish/v2/bubbletea"
 
@@ -41,16 +42,17 @@ func runTeaProgram(sess sshlib.Session, broadcaster *sizeBroadcaster, model tea.
 // it routes an SSH session by username to the menu, the "new agent" flow,
 // or a direct agent attach.
 func newSessionHandler(clients *k8sctl.Clients, cfg Config) wish.Middleware {
+	resumes := newResumeStore()
 	return func(next sshlib.Handler) sshlib.Handler {
 		return func(sess sshlib.Session) {
-			handleSession(sess, clients, cfg)
+			handleSession(sess, clients, cfg, resumes)
 			next(sess)
 		}
 	}
 }
 
-func handleSession(sess sshlib.Session, clients *k8sctl.Clients, cfg Config) {
-	ctx := sess.Context()
+func handleSession(sess sshlib.Session, clients *k8sctl.Clients, cfg Config, resumes *resumeStore) {
+	var ctx context.Context = sess.Context()
 	user := sess.User()
 	logger := slog.With("user", user, "remote", sess.RemoteAddr().String())
 
@@ -78,6 +80,23 @@ func handleSession(sess sshlib.Session, clients *k8sctl.Clients, cfg Config) {
 
 	route := agents.DecideRoute(user)
 	logger.Info("routing session", "route", route.Kind.String())
+
+	// levi@ and new@ sessions remember a dropped attach so a quick reconnect
+	// (phone clients drop idle connections) lands back in that agent.
+	// menu@ always shows the menu, and name@ already goes straight in.
+	if (route.Kind == agents.RouteMenu && user != "menu") || route.Kind == agents.RouteNew {
+		key := user + " " + gossh.FingerprintSHA256(sess.PublicKey())
+		ctx = withResumeTracker(ctx, &resumeTracker{store: resumes, key: key})
+		if agent, ok := resumes.recent(key); ok {
+			logger.Info("resuming dropped attach", "agent", agent)
+			if !resumeDroppedAttach(ctx, sess, clients, cfg, broadcaster, agent, pty.Term) {
+				return
+			}
+			if route.Kind == agents.RouteNew {
+				return
+			}
+		}
+	}
 
 	switch route.Kind {
 	case agents.RouteInvalid:
@@ -139,7 +158,9 @@ func runNewAgentFlow(ctx context.Context, sess sshlib.Session, clients *k8sctl.C
 	}
 
 	pod := agents.SandboxName(nm.result.Name)
-	err = attachCommand(ctx, clients, cfg.Namespace, pod, herdrCommand(term, cfg.DebugEcho), sess, sess, nil, broadcaster.TerminalSizeQueue())
+	err = trackAttach(ctx, nm.result.Name, func() error {
+		return attachCommand(ctx, clients, cfg.Namespace, pod, herdrCommand(term, cfg.DebugEcho), sess, sess, nil, broadcaster.TerminalSizeQueue())
+	})
 	if err != nil {
 		wish.Errorf(sess, "attach to agent-%s: %v\r\n", nm.result.Name, err)
 	}
@@ -183,4 +204,25 @@ func runDirectAttach(ctx context.Context, sess sshlib.Session, clients *k8sctl.C
 	if err := attachCommand(ctx, clients, cfg.Namespace, pod, herdrCommand(term, cfg.DebugEcho), sess, sess, nil, broadcaster.TerminalSizeQueue()); err != nil {
 		wish.Errorf(sess, "attach to agent-%s: %v\r\n", name, err)
 	}
+}
+
+// resumeDroppedAttach reattaches to the agent a previous connection was in
+// when it dropped. It returns false if this connection has ended too.
+func resumeDroppedAttach(ctx context.Context, sess sshlib.Session, clients *k8sctl.Clients, cfg Config, broadcaster *sizeBroadcaster, name, term string) bool {
+	wish.Printf(sess, "Reconnecting to agent-%s (log in as menu@ for the menu)\r\n", name)
+	pod, err := resumeAndWaitReady(ctx, clients, cfg.Namespace, name, sess)
+	if err != nil {
+		if t, ok := ctx.Value(resumeTrackerKey{}).(*resumeTracker); ok {
+			t.store.forget(t.key)
+		}
+		wish.Errorf(sess, "%v\r\n", err)
+		return ctx.Err() == nil
+	}
+	err = trackAttach(ctx, name, func() error {
+		return attachCommand(ctx, clients, cfg.Namespace, pod, herdrCommand(term, cfg.DebugEcho), sess, sess, nil, broadcaster.TerminalSizeQueue())
+	})
+	if err != nil && ctx.Err() == nil {
+		wish.Errorf(sess, "attach to agent-%s: %v\r\n", name, err)
+	}
+	return ctx.Err() == nil
 }
