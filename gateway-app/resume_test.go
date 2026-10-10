@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	tea "charm.land/bubbletea/v2"
 )
 
 func TestResumeStoreWindow(t *testing.T) {
@@ -51,5 +53,24 @@ func TestTrackAttachStdinEOFRemembers(t *testing.T) {
 	})
 	if a, ok := s.recent("k"); !ok || a != "smoke" {
 		t.Fatalf("recent = %q, %v; want smoke, true after stdin EOF", a, ok)
+	}
+}
+
+func TestResumePromptKeys(t *testing.T) {
+	m := newResumePromptModel("smoke")
+	next, _ := m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+	if rp := next.(resumePromptModel); !rp.resume || !rp.done {
+		t.Errorf("enter should resume now, got %+v", rp)
+	}
+	next, _ = m.Update(tea.KeyPressMsg{Code: 'x', Text: "x"})
+	if rp := next.(resumePromptModel); rp.resume || !rp.done {
+		t.Errorf("another key should go to the menu, got %+v", rp)
+	}
+	for i := 0; i < resumeCountdown; i++ {
+		next, _ = m.Update(resumeTickMsg{})
+		m = next.(resumePromptModel)
+	}
+	if !m.resume || !m.done {
+		t.Errorf("countdown expiry should resume, got %+v", m)
 	}
 }

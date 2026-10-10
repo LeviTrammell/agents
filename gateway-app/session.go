@@ -89,12 +89,20 @@ func handleSession(sess sshlib.Session, clients *k8sctl.Clients, cfg Config, res
 		key := user + " " + gossh.FingerprintSHA256(sess.PublicKey())
 		ctx = withResumeTracker(ctx, &resumeTracker{store: resumes, key: key})
 		if agent, ok := resumes.recent(key); ok {
-			logger.Info("resuming dropped attach", "agent", agent)
-			if !resumeDroppedAttach(ctx, sess, clients, cfg, broadcaster, agent, pty.Term) {
-				return
-			}
-			if route.Kind == agents.RouteNew {
-				return
+			final, err := runTeaProgram(sess, broadcaster, newResumePromptModel(agent))
+			if rp, ok := final.(resumePromptModel); err == nil && ok && rp.resume {
+				logger.Info("resuming dropped attach", "agent", agent)
+				if !resumeDroppedAttach(ctx, sess, clients, cfg, broadcaster, agent, pty.Term) {
+					return
+				}
+				if route.Kind == agents.RouteNew {
+					return
+				}
+			} else {
+				resumes.forget(key)
+				if ctx.Err() != nil {
+					return
+				}
 			}
 		}
 	}
@@ -210,7 +218,6 @@ func runDirectAttach(ctx context.Context, sess sshlib.Session, clients *k8sctl.C
 // resumeDroppedAttach reattaches to the agent a previous connection was in
 // when it dropped. It returns false if this connection has ended too.
 func resumeDroppedAttach(ctx context.Context, sess sshlib.Session, clients *k8sctl.Clients, cfg Config, broadcaster *sizeBroadcaster, name, term string) bool {
-	wish.Printf(sess, "Reconnecting to agent-%s (log in as menu@ for the menu)\r\n", name)
 	pod, err := resumeAndWaitReady(ctx, clients, cfg.Namespace, name, sess)
 	if err != nil {
 		if t, ok := ctx.Value(resumeTrackerKey{}).(*resumeTracker); ok {
